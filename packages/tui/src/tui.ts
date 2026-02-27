@@ -145,6 +145,22 @@ export interface OverlayOptions {
 	 * Called each render cycle with current terminal dimensions.
 	 */
 	visible?: (termWidth: number, termHeight: number) => boolean;
+
+	// === Content pushing ===
+	/**
+	 * When true, the base content is rendered at a narrower width to make room
+	 * for this overlay, instead of rendering at full terminal width underneath it.
+	 *
+	 * Only effective for overlays anchored to `"left-center"` or `"right-center"`.
+	 * For right-anchored overlays, the content width is reduced on the right side.
+	 * For left-anchored overlays, the content width is reduced on the left side.
+	 *
+	 * This enables persistent side-panel patterns where the main content should
+	 * reflow to avoid being obscured by the overlay.
+	 *
+	 * @default false
+	 */
+	pushContent?: boolean;
 }
 
 /**
@@ -676,6 +692,26 @@ export class TUI extends Container {
 		}
 	}
 
+	/**
+	 * Calculate the total width reserved by pushContent overlays.
+	 * This width is subtracted from the content area so overlays don't obscure base content.
+	 */
+	private getPushContentWidth(termWidth: number, termHeight: number): number {
+		let reserved = 0;
+		for (const entry of this.overlayStack) {
+			if (!this.isOverlayVisible(entry)) continue;
+			const opt = entry.options;
+			if (!opt?.pushContent) continue;
+			// Only left-center and right-center anchored overlays can push content
+			const anchor = opt.anchor ?? "center";
+			if (anchor !== "left-center" && anchor !== "right-center") continue;
+			// Calculate the overlay's resolved width
+			const { width } = this.resolveOverlayLayout(opt, 0, termWidth, termHeight);
+			reserved += width;
+		}
+		return reserved;
+	}
+
 	/** Composite all overlays into content lines (in stack order, later = on top). */
 	private compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
 		if (this.overlayStack.length === 0) return lines;
@@ -858,8 +894,12 @@ export class TUI extends Container {
 			return targetScreenRow - currentScreenRow;
 		};
 
-		// Render all components to get new lines
-		let newLines = this.render(width);
+		// Calculate content width reduction from pushContent overlays
+		const pushReserved = this.overlayStack.length > 0 ? this.getPushContentWidth(width, height) : 0;
+		const contentWidth = pushReserved > 0 ? Math.max(1, width - pushReserved) : width;
+
+		// Render all components to get new lines (at reduced width if overlays push content)
+		let newLines = this.render(contentWidth);
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
