@@ -40,6 +40,10 @@ export class Loader extends Text {
 		}
 	}
 
+	dispose() {
+		this.stop();
+	}
+
 	setMessage(message: string) {
 		this.message = message;
 		this.updateDisplay();

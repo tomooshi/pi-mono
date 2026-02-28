@@ -4388,6 +4388,14 @@ export class InteractiveMode {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
 		}
+		if (this.autoCompactionLoader) {
+			this.autoCompactionLoader.stop();
+			this.autoCompactionLoader = undefined;
+		}
+		if (this.retryLoader) {
+			this.retryLoader.stop();
+			this.retryLoader = undefined;
+		}
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

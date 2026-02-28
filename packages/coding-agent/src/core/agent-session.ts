@@ -328,83 +328,99 @@ export class AgentSession {
 	};
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			const messageText = this._getUserMessageText(event.message);
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
+		// This handler is called as a fire-and-forget async callback from
+		// the synchronous Agent.emit(). Any unhandled rejection here would
+		// silently swallow errors and could leave UI in a broken state
+		// (e.g. Loader intervals never stopped). Wrap everything so that
+		// _emit(event) is always reached for critical lifecycle events.
+		try {
+			// When a user message starts, check if it's from either queue and remove it BEFORE emitting
+			// This ensures the UI sees the updated queue state
+			if (event.type === "message_start" && event.message.role === "user") {
+				const messageText = this._getUserMessageText(event.message);
+				if (messageText) {
+					// Check steering queue first
+					const steeringIndex = this._steeringMessages.indexOf(messageText);
+					if (steeringIndex !== -1) {
+						this._steeringMessages.splice(steeringIndex, 1);
+					} else {
+						// Check follow-up queue
+						const followUpIndex = this._followUpMessages.indexOf(messageText);
+						if (followUpIndex !== -1) {
+							this._followUpMessages.splice(followUpIndex, 1);
+						}
 					}
 				}
 			}
-		}
 
-		// Emit to extensions first
-		await this._emitExtensionEvent(event);
-
-		// Notify all listeners
-		this._emit(event);
-
-		// Handle session persistence
-		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+			// Emit to extensions first, but never let extension errors
+			// prevent core event delivery (e.g. agent_end must always
+			// reach UI listeners to stop Loader intervals)
+			try {
+				await this._emitExtensionEvent(event);
+			} catch (err) {
+				console.error("Extension error during event emission:", err);
 			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-			// Track assistant message for auto-compaction (checked on agent_end)
-			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
+			// Notify all listeners — this MUST run so UI can clean up
+			// resources like Loader intervals on agent_end
+			this._emit(event);
 
-				// Reset retry counter immediately on successful assistant response
-				// This prevents accumulation across multiple LLM calls within a turn
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this._retryAttempt,
-					});
-					this._retryAttempt = 0;
-					this._resolveRetry();
+			// Handle session persistence
+			if (event.type === "message_end") {
+				// Check if this is a custom message from extensions
+				if (event.message.role === "custom") {
+					// Persist as CustomMessageEntry
+					this.sessionManager.appendCustomMessageEntry(
+						event.message.customType,
+						event.message.content,
+						event.message.display,
+						event.message.details,
+					);
+				} else if (
+					event.message.role === "user" ||
+					event.message.role === "assistant" ||
+					event.message.role === "toolResult"
+				) {
+					// Regular LLM message - persist as SessionMessageEntry
+					this.sessionManager.appendMessage(event.message);
+				}
+				// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+
+				// Track assistant message for auto-compaction (checked on agent_end)
+				if (event.message.role === "assistant") {
+					this._lastAssistantMessage = event.message;
+
+					// Reset retry counter immediately on successful assistant response
+					// This prevents accumulation across multiple LLM calls within a turn
+					const assistantMsg = event.message as AssistantMessage;
+					if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+						this._emit({
+							type: "auto_retry_end",
+							success: true,
+							attempt: this._retryAttempt,
+						});
+						this._retryAttempt = 0;
+						this._resolveRetry();
+					}
 				}
 			}
-		}
 
-		// Check auto-retry and auto-compaction after agent completes
-		if (event.type === "agent_end" && this._lastAssistantMessage) {
-			const msg = this._lastAssistantMessage;
-			this._lastAssistantMessage = undefined;
+			// Check auto-retry and auto-compaction after agent completes
+			if (event.type === "agent_end" && this._lastAssistantMessage) {
+				const msg = this._lastAssistantMessage;
+				this._lastAssistantMessage = undefined;
 
-			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this._isRetryableError(msg)) {
-				const didRetry = await this._handleRetryableError(msg);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				// Check for retryable errors first (overloaded, rate limit, server errors)
+				if (this._isRetryableError(msg)) {
+					const didRetry = await this._handleRetryableError(msg);
+					if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				}
+
+				await this._checkCompaction(msg);
 			}
-
-			await this._checkCompaction(msg);
+		} catch (err) {
+			console.error("Unhandled error in agent event handler:", err);
 		}
 	}
 
