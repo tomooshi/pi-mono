@@ -234,6 +234,7 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private previousBaseLines: string[] = []; // Base content without overlay compositing (for clean scrollback)
 
 	// Overlay stack for modal components rendered on top of base content
 	private overlayStack: {
@@ -901,9 +902,36 @@ export class TUI extends Container {
 		// Render all components to get new lines (at reduced width if overlays push content)
 		let newLines = this.render(contentWidth);
 
+		// Save base content lines BEFORE overlay compositing.
+		// These are used to "scrub" lines clean before they scroll into the
+		// terminal's scrollback buffer, preventing overlay (e.g. sidebar) content
+		// from being permanently baked into scrollback history.
+		const hasOverlays = this.overlayStack.length > 0;
+		let baseLines: string[] | null = null;
+		if (hasOverlays && pushReserved > 0) {
+			const reset = TUI.SEGMENT_RESET;
+			baseLines = newLines.map((line) => {
+				if (isImageLine(line)) return line;
+				// Pad base line to full terminal width so the scrub overwrites
+				// any residual overlay characters already on screen
+				const w = visibleWidth(line);
+				const padded = w < width ? line + " ".repeat(width - w) : line;
+				return padded + reset;
+			});
+		}
+
 		// Composite overlays into the rendered lines (before differential compare)
-		if (this.overlayStack.length > 0) {
+		if (hasOverlays) {
 			newLines = this.compositeOverlays(newLines, width, height);
+		}
+
+		// Pad baseLines to match composited length (compositeOverlays pads for working area)
+		if (baseLines && baseLines.length < newLines.length) {
+			const reset = TUI.SEGMENT_RESET;
+			const emptyPadded = " ".repeat(width) + reset;
+			while (baseLines.length < newLines.length) {
+				baseLines.push(emptyPadded);
+			}
 		}
 
 		// Extract cursor position before applying line resets (marker must be found first)
@@ -936,6 +964,7 @@ export class TUI extends Container {
 			this.previousViewportTop = Math.max(0, this.maxLinesRendered - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
+			this.previousBaseLines = baseLines ?? newLines;
 			this.previousWidth = width;
 		};
 
@@ -1062,6 +1091,28 @@ export class TUI extends Container {
 				buffer += `\x1b[${moveToBottom}B`;
 			}
 			const scroll = moveTargetRow - prevViewportBottom;
+
+			// Scrub overlay content from lines about to enter scrollback.
+			// When \r\n is emitted at the bottom of the screen, the top lines
+			// scroll into the terminal's scrollback buffer. If those lines contain
+			// composited overlay content (e.g., a sidebar), it would be permanently
+			// baked into scrollback. We rewrite those lines with base-only content
+			// (no overlay) before scrolling, so scrollback stays clean.
+			if (scroll > 0 && this.previousBaseLines.length > 0) {
+				const scrubCount = Math.min(scroll, height);
+				for (let s = 0; s < scrubCount; s++) {
+					const absIdx = prevViewportTop + s;
+					if (absIdx < this.previousBaseLines.length) {
+						// Use absolute cursor positioning (1-indexed) to reach the screen row
+						buffer += `\x1b[${s + 1};1H`;
+						buffer += "\x1b[2K"; // clear line
+						buffer += this.previousBaseLines[absIdx];
+					}
+				}
+				// Return cursor to bottom of screen
+				buffer += `\x1b[${height};1H`;
+			}
+
 			buffer += "\r\n".repeat(scroll);
 			prevViewportTop += scroll;
 			viewportTop += scroll;
@@ -1183,6 +1234,7 @@ export class TUI extends Container {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
+		this.previousBaseLines = baseLines ?? newLines;
 		this.previousWidth = width;
 	}
 
