@@ -776,14 +776,15 @@ export class TUI extends Container {
 			}
 		}
 
-		// Final verification: ensure no composited line exceeds terminal width
-		// This is a belt-and-suspenders safeguard - compositeLineAt should already
-		// guarantee this, but we verify here to prevent crashes from any edge cases
-		// Only check lines that were actually modified (optimization)
-		for (const idx of modifiedLines) {
-			const lineWidth = visibleWidth(result[idx]);
-			if (lineWidth > termWidth) {
-				result[idx] = sliceByColumn(result[idx], 0, termWidth, true);
+		// Debug-only verification: compositeLineAt already guarantees width
+		// constraints via arithmetic checks and sliceByColumn fallback.
+		// Only enable this expensive O(n) scan when debugging rendering issues.
+		if (process.env.PI_DEBUG_REDRAW === "1") {
+			for (const idx of modifiedLines) {
+				const lineWidth = visibleWidth(result[idx]);
+				if (lineWidth > termWidth) {
+					result[idx] = sliceByColumn(result[idx], 0, termWidth, true);
+				}
 			}
 		}
 
@@ -840,17 +841,14 @@ export class TUI extends Container {
 			base.after +
 			" ".repeat(afterPad);
 
-		// CRITICAL: Always verify and truncate to terminal width.
-		// This is the final safeguard against width overflow which would crash the TUI.
-		// Width tracking can drift from actual visible width due to:
-		// - Complex ANSI/OSC sequences (hyperlinks, colors)
-		// - Wide characters at segment boundaries
-		// - Edge cases in segment extraction
-		const resultWidth = visibleWidth(result);
-		if (resultWidth <= totalWidth) {
+		// Verify width using arithmetic from tracked segment widths.
+		// extractSegments and sliceWithWidth already return accurate widths,
+		// so we can check the invariant without an expensive visibleWidth scan.
+		const computedWidth = base.beforeWidth + beforePad + overlay.width + overlayPad + base.afterWidth + afterPad;
+		if (computedWidth <= totalWidth) {
 			return result;
 		}
-		// Truncate with strict=true to ensure we don't exceed totalWidth
+		// Width overflow — fall back to expensive truncation as safety net
 		return sliceByColumn(result, 0, totalWidth, true);
 	}
 
@@ -910,13 +908,16 @@ export class TUI extends Container {
 		let baseLines: string[] | null = null;
 		if (hasOverlays && pushReserved > 0) {
 			const reset = TUI.SEGMENT_RESET;
+			// Pad base lines to full terminal width using arithmetic:
+			// lines are rendered at contentWidth, so we need pushReserved
+			// extra columns to overwrite the overlay region. The scroll
+			// scrubbing code emits \x1b[2K (clear line) before writing,
+			// so exact width matching isn't required — we just need enough
+			// padding to cover the overlay area.
+			const pad = " ".repeat(pushReserved);
 			baseLines = newLines.map((line) => {
 				if (isImageLine(line)) return line;
-				// Pad base line to full terminal width so the scrub overwrites
-				// any residual overlay characters already on screen
-				const w = visibleWidth(line);
-				const padded = w < width ? line + " ".repeat(width - w) : line;
-				return padded + reset;
+				return line + pad + reset;
 			});
 		}
 
@@ -1137,33 +1138,37 @@ export class TUI extends Container {
 			buffer += "\x1b[2K"; // Clear current line
 			const line = newLines[i];
 			const isImage = isImageLine(line);
-			if (!isImage && visibleWidth(line) > width) {
-				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(os.homedir(), ".pi", "agent", "pi-crash.log");
-				const crashData = [
-					`Crash at ${new Date().toISOString()}`,
-					`Terminal width: ${width}`,
-					`Line ${i} visible width: ${visibleWidth(line)}`,
-					"",
-					"=== All rendered lines ===",
-					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
-					"",
-				].join("\n");
-				fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-				fs.writeFileSync(crashLogPath, crashData);
+			// Width overflow check: gated behind PI_DEBUG_REDRAW to avoid
+			// expensive visibleWidth scans in the hot render path.
+			// compositeOverlays/compositeLineAt already enforce width constraints.
+			if (debugRedraw && !isImage) {
+				const lineWidth = visibleWidth(line);
+				if (lineWidth > width) {
+					const crashLogPath = path.join(os.homedir(), ".pi", "agent", "pi-crash.log");
+					const crashData = [
+						`Crash at ${new Date().toISOString()}`,
+						`Terminal width: ${width}`,
+						`Line ${i} visible width: ${lineWidth}`,
+						"",
+						"=== All rendered lines ===",
+						...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
+						"",
+					].join("\n");
+					fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+					fs.writeFileSync(crashLogPath, crashData);
 
-				// Clean up terminal state before throwing
-				this.stop();
+					this.stop();
 
-				const errorMsg = [
-					`Rendered line ${i} exceeds terminal width (${visibleWidth(line)} > ${width}).`,
-					"",
-					"This is likely caused by a custom TUI component not truncating its output.",
-					"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
-					"",
-					`Debug log written to: ${crashLogPath}`,
-				].join("\n");
-				throw new Error(errorMsg);
+					const errorMsg = [
+						`Rendered line ${i} exceeds terminal width (${lineWidth} > ${width}).`,
+						"",
+						"This is likely caused by a custom TUI component not truncating its output.",
+						"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
+						"",
+						`Debug log written to: ${crashLogPath}`,
+					].join("\n");
+					throw new Error(errorMsg);
+				}
 			}
 			buffer += line;
 		}

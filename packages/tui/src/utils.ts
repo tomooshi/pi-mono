@@ -33,8 +33,9 @@ const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark
 const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/v;
 const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
 
-// Cache for non-ASCII strings
-const WIDTH_CACHE_SIZE = 512;
+// LRU cache for non-ASCII string widths.
+// Sized to 2× typical terminal height to cover working set without thrashing.
+const WIDTH_CACHE_SIZE = 2048;
 const widthCache = new Map<string, number>();
 
 /**
@@ -96,9 +97,11 @@ export function visibleWidth(str: string): number {
 		return str.length;
 	}
 
-	// Check cache
+	// Check cache (LRU: delete + re-insert moves entry to end of Map iteration order)
 	const cached = widthCache.get(str);
 	if (cached !== undefined) {
+		widthCache.delete(str);
+		widthCache.set(str, cached);
 		return cached;
 	}
 
