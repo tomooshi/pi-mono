@@ -95,11 +95,15 @@ export function transformMessages<TApi extends Api>(
 		return msg;
 	});
 
-	// Second pass: insert synthetic empty tool results for orphaned tool calls
-	// This preserves thinking signatures and satisfies API requirements
+	// Second pass: fix orphaned tool blocks in both directions
+	// - Orphaned tool_use (assistant has toolCalls, no toolResult follows): insert synthetic results
+	// - Orphaned tool_result (toolResult without matching toolCall in any prior assistant): drop it
+	// Both cases can occur after compaction/context_checkout prunes messages from the history.
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
+	// Track ALL toolCall IDs from assistant messages seen so far
+	const knownToolCallIds = new Set<string>();
 
 	for (let i = 0; i < transformed.length; i++) {
 		const msg = transformed[i];
@@ -139,9 +143,16 @@ export function transformMessages<TApi extends Api>(
 				pendingToolCalls = toolCalls;
 				existingToolResultIds = new Set();
 			}
+			for (const tc of toolCalls) {
+				knownToolCallIds.add(tc.id);
+			}
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
+			// Drop orphaned toolResults whose parent assistant was pruned (e.g., by compaction)
+			if (!knownToolCallIds.has(msg.toolCallId)) {
+				continue;
+			}
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {
